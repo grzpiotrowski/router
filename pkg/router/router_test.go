@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 
+	kclientset "k8s.io/client-go/kubernetes"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"k8s.io/klog/v2"
@@ -43,6 +45,7 @@ import (
 )
 
 type harness struct {
+	client      kclientset.Interface
 	routeClient routeclient.Interface
 
 	namespace string
@@ -76,6 +79,7 @@ func TestMain(m *testing.M) {
 	namespace := "default"
 
 	h = &harness{
+		client:      client,
 		routeClient: routeClient,
 		namespace:   namespace,
 	}
@@ -643,15 +647,40 @@ func TestConfigTemplate(t *testing.T) {
 				},
 			},
 		},
+		"Valid Health Check Interval": {
+			mustCreateWithConfig{
+				mustCreateService: mustCreateService{
+					name: "servicep",
+				},
+				mustCreate: mustCreate{
+					name:              "p",
+					host:              "pexample.com",
+					path:              "",
+					targetServiceName: "servicep",
+					time:              start,
+					annotations: map[string]string{
+						"router.openshift.io/haproxy.health.check.interval": "10000ms",
+					},
+				},
+				mustMatchConfig: mustMatchConfig{
+					section:     "backend",
+					sectionName: insecureBackendName(h.namespace, "p"),
+					attribute:   "server",
+					value:       "check inter 10000ms",
+				},
+			},
+		},
 	}
 
 	defer cleanUpRoutes(t)
 
 	for name, expectations := range tests {
 		for _, expectation := range expectations {
-			err := expectation.Apply(h)
-			if err != nil {
-				t.Fatalf("%s failed: %v", name, err)
+			if !reflect.DeepEqual(expectation.mustCreate, mustCreate{}) {
+				err := expectation.mustCreate.Apply(h)
+				if err != nil {
+					t.Fatalf("%s mustCreate failed: %v", name, err)
+				}
 			}
 		}
 	}
@@ -709,6 +738,9 @@ type mustCreate struct {
 	host string
 	// path is the spec.path of the route.
 	path string
+	// targetServiceName is the spec.to.name of the route.  If this field
+	// is empty, a name is generated based on the route's name.
+	targetServiceName string
 	// time is the metadata.creationTimestamp of the route.
 	time time.Time
 	// annotations is the metadata.annotations of the route.
@@ -738,6 +770,10 @@ func (e mustCreate) Apply(h *harness) error {
 			Certificate: e.cert,
 		}
 	}
+	serviceName := "service" + e.name
+	if e.targetServiceName != "" {
+		serviceName = e.targetServiceName
+	}
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			CreationTimestamp: metav1.Time{Time: e.time},
@@ -750,7 +786,7 @@ func (e mustCreate) Apply(h *harness) error {
 			Host: e.host,
 			Path: e.path,
 			To: routev1.RouteTargetReference{
-				Name:   "service" + e.name,
+				Name:   serviceName,
 				Weight: new(int32),
 			},
 			WildcardPolicy: routev1.WildcardPolicyNone,
@@ -762,7 +798,42 @@ func (e mustCreate) Apply(h *harness) error {
 	return err
 }
 
+// mustCreateService represents an service that gets created in a unit test.
+type mustCreateService struct {
+	// name is the metadata.name of the service. If name is empty,
+	// no service is created.
+	name string
+}
+
+func (e mustCreateService) Apply(h *harness) error {
+	if e.name == "" {
+		return nil
+	}
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: h.namespace,
+			Name:      e.name,
+			UID:       h.nextUID(),
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name:     "servicep",
+					Port:     8443,
+					Protocol: "TCP",
+				},
+			},
+		},
+	}
+
+	_, err := h.client.CoreV1().Services(service.Namespace).Create(context.TODO(), service, metav1.CreateOptions{})
+
+	return err
+}
+
 type mustCreateWithConfig struct {
+	mustCreateService
 	mustCreate
 	mustMatchConfig
 }
@@ -824,6 +895,13 @@ func matchConfig(m mustMatchConfig, parser haproxyconfparser.Parser) error {
 				break
 			}
 		}
+	case []haproxyconfparsertypes.Server:
+		for _, a := range data {
+			for _, b := range a.Params {
+				contains = contains || b.String() == m.value
+			}
+		}
+
 	}
 
 	if !contains && !m.notFound {
